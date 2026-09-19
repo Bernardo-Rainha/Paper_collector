@@ -3,7 +3,7 @@ A simple Python Script that pulls out paper from three diferents fonts from thei
 
 # Fonts
 
-## arxive repository
+## arXive repository
 The arXive had a public API for pull requests and download papers
 
 ## NASA NTRS
