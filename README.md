@@ -11,7 +11,7 @@ The sources have slightly different search modes, but nothing special. They use 
 
 The program was ENTIRELY designed as a daily application running on Obsidian software, with its files edited in markdown format with native YMAL. Just put it in your vault and set it to repeat every day or every 7 days. and has a STRONG bias towards computing, engineering, mechanics and physics (you can change the keywords in the script)
 
-
+---
 # Sources
 
 ## arXive repository
