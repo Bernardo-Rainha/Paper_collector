@@ -1,13 +1,19 @@
-
 """
 FONTES (rodam juntas):
   1. arXiv API
-  
+
   2. Semantic Scholar API — requer respeitar 1 req/s .
      Coloque sua chave na variável S2_API_KEY abaixo
-     # Chave gratuita em https://www.semanticscholar.org/product/api para contas estudantis
+     Chave gratuita em https://www.semanticscholar.org/product/api para contas estudantis
 
   3. NASA NTRS (https://ntrs.nasa.gov/api)
+
+  4. OpenAlex (https://api.openalex.org) — sem chave, ~10 req/s.
+     Cobertura total: periódicos, conferências, repositórios.
+
+  5. SciELO (via OpenAlex filtrado por URLs scielo.*) — artigos
+     open access em português/español hospedados na SciELO.
+     (A SciELO não tem API própria de busca; é indexada pelo OpenAlex.)
 
 COMANDOS:
   python papers_collector.py             # coleta normal
@@ -30,7 +36,7 @@ from datetime import datetime, timedelta
 # ============================ CONFIGURAÇÕES ============================
 KEYWORDS = [
     "software engineering", "microservices", "embedded systems",
-    "computer architecture" "Information Retrieval", "devops", "machine learning",
+    "computer architecture", "Information Retrieval", "devops", "machine learning",
     "internet of things", "cloud computing", "ci/cd",
 ]
 
@@ -45,21 +51,29 @@ DOWNLOAD_PDF = True
 USE_SEMANTIC_SCHOLAR = True
 S2_MAX_RESULTS = 5
 S2_MAX_RETRIES = 2
-S2_PACING = 1.3               # segundos ENTRE requisições S2 (limite oficial: 1 req/s)
+S2_PACING = 1.5               # segundos ENTRE requisições S2 (limite oficial: 1 req/s)
 
 USE_NTRS = True               # fonte 3: NASA Technical Reports Server
-NTRS_MAX_RESULTS = 5          
-NTRS_PACING = 1.0             
+NTRS_MAX_RESULTS = 5
+NTRS_PACING = 1.0
 
+USE_OPENALEX = True           # fonte 4
+OPENALEX_MAX_RESULTS = 5
+OPENALEX_PACING = 0.5         # limite anônimo ~10 req/s; folga de sobra
+
+USE_SCIELO = True             # fonte 5 (OpenAlex filtrado p/ scielo.*)
+SCIELO_MAX_RESULTS = 5
+
+# ======================================================================
 # >>> COLE SUA CHAVE AQUI (entre aspas) <<<
 S2_API_KEY = ""
-# ======================================================================
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 NTRS_API = "https://ntrs.nasa.gov/api"
+OPENALEX_API = "https://api.openalex.org/works"
 SEEN_FILE = os.path.join(OUTPUT_DIR, "vistos.json")
-UA = {"User-Agent": "papers-collector/2.3 (uso pessoal; estudo)"}
+UA = {"User-Agent": "papers-collector/3.0 (uso pessoal; estudo)"}
 
 
 # Estado (deduplicação)
@@ -240,15 +254,6 @@ def testar_s2():
     except Exception as e:
         print(f"  ✗ erro de rede: {e}")
         return False
-    total = data.get("total", 0)
-    print(f"  ✓ SUCESSO — {total} papers no índice para 'computer science'")
-    if rate.get("x-ratelimit-remaining") is not None:
-        print(f"  limite: {rate['x-ratelimit-limit']} | "
-              f"restantes: {rate['x-ratelimit-remaining']} | "
-              f"reset: {rate['x-ratelimit-reset']}")
-    else:
-        print("  (headers de rate limit ausentes — normal em algumas contas)")
-    return True
 
 
 def buscar_semantic_scholar(data_corte, max_total, limite_por_kw=20):
@@ -403,6 +408,91 @@ def buscar_ntrs(data_corte, max_total):
     return papers[:max_total]
 
 
+# Fontes 4 e 5: OpenAlex (4 = tudo, 5 = só SciELO)
+def reconstruir_abstract(inv):
+    """OpenAlex manda o abstract como índice invertido; reconstrói o texto."""
+    if not inv:
+        return ""
+    posicoes = {}
+    for palavra, idxs in inv.items():
+        for i in idxs:
+            posicoes[i] = palavra
+    return " ".join(posicoes[i] for i in sorted(posicoes))
+
+
+def _urls_scielo(work):
+    """True se alguma localização do work apontar pra scielo.*"""
+    urls = []
+    for loc in work.get("locations", []) or []:
+        urls.append(loc.get("landing_page_url") or "")
+        urls.append((loc.get("pdf_url") or ""))
+    return any("scielo." in u for u in urls)
+
+
+def buscar_openalex(data_corte, max_total, so_scielo=False, por_kw=20):
+    """Busca works por keyword. so_scielo=True filtra client-side
+    só artigos hospedados na SciELO (fonte 5)."""
+    prefixo = "scielo:" if so_scielo else "openalex:"
+    nome_fonte = "SciELO" if so_scielo else "OpenAlex"
+    papers, vistos_local = [], set()
+
+    for kw in KEYWORDS:
+        if len(papers) >= max_total:
+            break
+        params = urllib.parse.urlencode({
+            "search": kw,
+            "filter": f"from_publication_date:{data_corte}",
+            "sort": "publication_date:desc",
+            "per-page": por_kw,
+        })
+        time.sleep(OPENALEX_PACING)
+        req = urllib.request.Request(f"{OPENALEX_API}?{params}", headers=UA)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            print(f"    ! OpenAlex HTTP {e.code} para '{kw}'", file=sys.stderr)
+            continue
+        except Exception as e:
+            print(f"    ! OpenAlex rede para '{kw}': {e}", file=sys.stderr)
+            continue
+
+        for w in data.get("results", []):
+            if len(papers) >= max_total:
+                break
+            pub = (w.get("publication_date") or "")[:10]
+            if pub and pub < data_corte:
+                break                        # ordenado desc: resto é antigo
+            if so_scielo and not _urls_scielo(w):
+                continue
+            wid = w.get("id", "").rsplit("/", 1)[-1]
+            if not wid or wid in vistos_local or not w.get("title"):
+                continue
+            vistos_local.add(wid)
+            loc = w.get("primary_location") or {}
+            source = (loc.get("source") or {})
+            keywords = [k.get("display_name", "") for k in
+                        (w.get("keywords") or [])[:5]]
+            if not keywords:
+                keywords = [t.get("display_name", "") for t in
+                            (w.get("topics") or [])[:5]]
+            papers.append({
+                "id": prefixo + wid,
+                "titulo": " ".join(w["title"].split()),
+                "resumo": reconstruir_abstract(w.get("abstract_inverted_index")),
+                "tldr": None,
+                "autores": [(a.get("author") or {}).get("display_name", "")
+                            for a in w.get("authorships", [])],
+                "publicado": pub or "????-??-??",
+                "url": loc.get("landing_page_url") or w.get("id", ""),
+                "pdf": (w.get("best_oa_location") or {}).get("pdf_url"),
+                "citacoes": w.get("cited_by_count", 0),
+                "categorias": [k for k in keywords if k][:5],
+                "fonte": nome_fonte,
+            })
+    return papers[:max_total]
+
+
 # Download e relatório
 def baixar_pdf(url, destino):
     try:
@@ -507,7 +597,7 @@ def buscar_colecao(termo):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Coletor de artigos (arXiv + Semantic Scholar)")
+    ap = argparse.ArgumentParser(description="Coletor de artigos (5 fontes)")
     ap.add_argument("--dry-run", action="store_true", help="só lista, não salva")
     ap.add_argument("--test-s2", action="store_true", help="testa a chave do S2 e sai")
     ap.add_argument("--busca", metavar="TERMO", help="busca na coleção local e sai")
@@ -558,7 +648,26 @@ def main():
         except Exception as e:
             print(f"  ! falha no NTRS: {e}", file=sys.stderr)
 
-    todos = papers_arxiv + papers_s2 + papers_ntrs
+    papers_oa = []
+    if USE_OPENALEX:
+        print("▶ Consultando OpenAlex...")
+        try:
+            papers_oa = buscar_openalex(data_corte, OPENALEX_MAX_RESULTS)
+            print(f"  {len(papers_oa)} papers na janela")
+        except Exception as e:
+            print(f"  ! falha no OpenAlex: {e}", file=sys.stderr)
+
+    papers_scielo = []
+    if USE_SCIELO:
+        print("▶ Consultando SciELO (via OpenAlex)...")
+        try:
+            papers_scielo = buscar_openalex(data_corte, SCIELO_MAX_RESULTS,
+                                            so_scielo=True, por_kw=50)
+            print(f"  {len(papers_scielo)} papers na janela")
+        except Exception as e:
+            print(f"  ! falha no SciELO: {e}", file=sys.stderr)
+
+    todos = papers_arxiv + papers_s2 + papers_ntrs + papers_oa + papers_scielo
     novos, vistos_agora = [], set()
     for p in todos:
         chave_t = norm_titulo(p["titulo"])
